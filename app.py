@@ -2,16 +2,18 @@ from flask import Flask, request, jsonify, redirect, session
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from openai import OpenAI
 import os
+
+# ---- Import OpenAI correctement ----
+import openai
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key"
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Initialisation OpenAI (clé chargée automatiquement via Render)
-client = OpenAI()
+# ---- Initialisation OpenAI avec clé d'environnement ----
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.route("/")
 def home():
@@ -47,7 +49,7 @@ def oauth2callback():
     return "✅ Connexion Google Agenda réussie ! Vous pouvez maintenant parler à votre assistant."
 
 
-# --- Étape 2 : Assistant qui comprend le langage naturel ---
+# --- Étape 2 : Traitement des commandes en langage naturel ---
 @app.route("/command", methods=["POST"])
 def handle_command():
     if "credentials" not in session:
@@ -58,17 +60,17 @@ def handle_command():
 
     user_command = request.json.get("command")
 
-    # Étape A — Demander à GPT d’analyser la commande
-    response = client.chat.completions.create(
+    # GPT analyse la commande
+    response = openai.ChatCompletion.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Tu es un assistant intelligent connecté à Google Agenda. "
-                    "Tu reçois des phrases naturelles (ex: 'efface le rdv Fnac le 10 octobre') "
-                    "et tu renvoies des instructions claires au format JSON :\n"
-                    "{'action': 'delete_event', 'summary': 'Fnac', 'date': '2025-10-10'}\n"
+                    "Tu es un assistant connecté à Google Agenda. "
+                    "Quand on te dit une phrase comme 'efface le rdv Fnac le 10 octobre', "
+                    "tu dois répondre uniquement en JSON clair : "
+                    "{'action': 'delete_event', 'summary': 'Fnac', 'date': '2025-10-10'} "
                     "ou {'action': 'add_event', 'summary': 'Réunion', 'start': '2025-10-10T10:00:00', 'end': '2025-10-10T11:00:00'}"
                 ),
             },
@@ -77,11 +79,11 @@ def handle_command():
     )
 
     try:
-        instruction = eval(response.choices[0].message.content)
+        instruction = eval(response.choices[0].message["content"])
     except Exception as e:
         return jsonify({"error": f"Impossible d’analyser la réponse GPT: {str(e)}"}), 400
 
-    # Étape B — Exécuter l'action demandée
+    # Exécution
     if instruction["action"] == "delete_event":
         return delete_event(service, instruction)
     elif instruction["action"] == "add_event":
@@ -90,7 +92,6 @@ def handle_command():
         return jsonify({"error": "Action non reconnue"}), 400
 
 
-# --- Étape 3 : Gestion des événements ---
 def delete_event(service, instruction):
     date = instruction["date"]
     summary = instruction["summary"].lower()
@@ -104,7 +105,6 @@ def delete_event(service, instruction):
     ).execute()
 
     events = events_result.get("items", [])
-
     for event in events:
         if summary in event["summary"].lower():
             service.events().delete(calendarId="primary", eventId=event["id"]).execute()
