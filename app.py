@@ -12,7 +12,9 @@ app.secret_key = "super_secret_key"
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 # Initialiser OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
 
 @app.route('/')
 def home():
