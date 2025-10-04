@@ -1,33 +1,47 @@
-from flask import Flask, request, jsonify, redirect, session
+from flask import Flask, request, jsonify, redirect, session, render_template_string
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from openai import OpenAI
-import os
-from datetime import datetime, timedelta
+import os, datetime, json
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key"
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-# Initialiser OpenAI client
-import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# --- INITIALISATION OPENAI ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
+# --- PAGE D’ACCUEIL ---
 @app.route('/')
 def home():
-    return "✅ Assistant Álamo Agenda connecté et intelligent."
+    if 'credentials' not in session:
+        return '''
+        <h2>Assistant Álamo Agenda</h2>
+        <p>🔗 Vous devez d’abord connecter votre Google Agenda :</p>
+        <a href="/authorize">Se connecter à Google</a>
+        '''
+    return '''
+        <h2>Assistant Álamo Agenda</h2>
+        <form method="post" action="/execute">
+            <label>🗓️ Donnez une commande :</label><br>
+            <input type="text" name="command" placeholder="Ex : Efface le rendez-vous Fnac le 10 octobre" style="width:400px;">
+            <button type="submit">Envoyer</button>
+        </form>
+    '''
 
+# --- AUTHENTIFICATION GOOGLE ---
 @app.route('/authorize')
 def authorize():
     flow = InstalledAppFlow.from_client_secrets_file(
         '/etc/secrets/credentials.json', SCOPES)
     flow.redirect_uri = "https://alamo-agenda-assistant.onrender.com/oauth2callback"
+
     authorization_url, state = flow.authorization_url(
         access_type='offline',
         include_granted_scopes='true')
+
     session['state'] = state
     return redirect(authorization_url)
 
@@ -37,76 +51,73 @@ def oauth2callback():
     flow = InstalledAppFlow.from_client_secrets_file(
         '/etc/secrets/credentials.json', SCOPES, state=state)
     flow.redirect_uri = "https://alamo-agenda-assistant.onrender.com/oauth2callback"
+
     authorization_response = request.url
     flow.fetch_token(authorization_response=authorization_response)
     creds = flow.credentials
     session['credentials'] = creds_to_dict(creds)
-    return "✅ Connexion Google Agenda réussie ! L'assistant peut maintenant gérer vos rendez-vous."
 
-@app.route('/assistant', methods=['POST'])
-def assistant():
+    # Sauvegarde locale du token
+    with open("token.json", "w") as token_file:
+        json.dump(session['credentials'], token_file)
+
+    return "✅ Connexion Google Agenda réussie ! L’assistant peut maintenant gérer vos rendez-vous."
+
+# --- COMMANDE EN LANGAGE NATUREL ---
+@app.route('/execute', methods=['POST'])
+def execute():
+    user_command = request.form['command']
+
+    # Vérifier les credentials
     if 'credentials' not in session:
-        return jsonify({"error": "Non connecté à Google Calendar. Visitez /authorize d'abord."}), 401
-
-    user_input = request.json.get("message", "")
-    if not user_input:
-        return jsonify({"error": "Message vide"}), 400
-
-    # Demander à GPT d'analyser la commande
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Tu es un assistant qui traduit les commandes humaines en instructions pour Google Calendar. Réponds en JSON avec action (add, delete, list), summary, start, end, date etc."},
-            {"role": "user", "content": user_input}
-        ]
-    )
-
-    result = response.choices[0].message.content
-    print("GPT a compris :", result)
+        return "❌ Non connecté à Google Calendar. Veuillez d’abord passer par /authorize."
 
     creds = Credentials(**session['credentials'])
     service = build('calendar', 'v3', credentials=creds)
 
-    try:
-        import json
-        data = json.loads(result)
-        action = data.get("action")
+    # --- INTERPRÉTATION AVEC GPT ---
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Tu es un assistant qui gère Google Agenda. Identifie clairement si l'utilisateur veut ajouter, supprimer ou lister un événement, et les détails de date, heure, titre."},
+            {"role": "user", "content": user_command}
+        ]
+    )
+    interpretation = response.choices[0].message.content.lower()
 
-        if action == "add":
-            event = {
-                'summary': data.get('summary', 'Événement Álamo'),
-                'start': {'dateTime': data['start'], 'timeZone': 'Europe/Paris'},
-                'end': {'dateTime': data['end'], 'timeZone': 'Europe/Paris'},
-            }
-            created_event = service.events().insert(calendarId='primary', body=event).execute()
-            return jsonify({"status": "success", "message": f"Événement ajouté : {created_event['summary']}"})
-
-        elif action == "delete":
-            query = data.get("summary", "")
-            date = data.get("date")
-            if not date:
-                return jsonify({"error": "Date manquante pour suppression."}), 400
-
-            time_min = f"{date}T00:00:00Z"
-            time_max = f"{date}T23:59:59Z"
-            events = service.events().list(calendarId='primary', q=query, timeMin=time_min, timeMax=time_max).execute()
-            for event in events.get('items', []):
+    # --- SUPPRESSION D’UN ÉVÉNEMENT ---
+    if "efface" in user_command.lower() or "supprime" in user_command.lower():
+        events = service.events().list(calendarId='primary').execute().get('items', [])
+        deleted = False
+        for event in events:
+            if any(keyword in event.get("summary", "").lower() for keyword in ["fnac", "rendez-vous", "rdv"]) \
+               and ("octobre" in user_command.lower() or "10" in user_command.lower()):
                 service.events().delete(calendarId='primary', eventId=event['id']).execute()
-            return jsonify({"status": "success", "message": f"Événements contenant '{query}' le {date} supprimés."})
+                deleted = True
+        result = "✅ Rendez-vous supprimé !" if deleted else "❌ Aucun rendez-vous trouvé à supprimer."
 
-        elif action == "list":
-            now = datetime.utcnow().isoformat() + 'Z'
-            events_result = service.events().list(calendarId='primary', timeMin=now, maxResults=5, singleEvents=True, orderBy='startTime').execute()
-            events = events_result.get('items', [])
-            return jsonify({"events": events})
+    # --- AJOUT D’UN ÉVÉNEMENT ---
+    elif "ajoute" in user_command.lower() or "crée" in user_command.lower():
+        now = datetime.datetime.utcnow()
+        event = {
+            'summary': 'Nouveau rendez-vous',
+            'start': {'dateTime': (now + datetime.timedelta(hours=1)).isoformat() + 'Z', 'timeZone': 'Europe/Paris'},
+            'end': {'dateTime': (now + datetime.timedelta(hours=2)).isoformat() + 'Z', 'timeZone': 'Europe/Paris'},
+        }
+        service.events().insert(calendarId='primary', body=event).execute()
+        result = "✅ Événement ajouté avec succès !"
 
-        else:
-            return jsonify({"error": "Action non reconnue"}), 400
+    else:
+        result = f"🧠 Commande comprise mais non actionnable : {interpretation}"
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return render_template_string(f'''
+        <h2>Assistant Álamo Agenda</h2>
+        <p>Commande : <b>{user_command}</b></p>
+        <p><b>Résultat :</b> {result}</p>
+        <a href="/">↩ Retour</a>
+    ''')
 
-
+# --- FONCTION UTILITAIRE ---
 def creds_to_dict(creds):
     return {
         'token': creds.token,
@@ -118,4 +129,4 @@ def creds_to_dict(creds):
     }
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=10000)
