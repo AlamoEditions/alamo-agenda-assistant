@@ -1,43 +1,139 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, session
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import os
+import datetime
+
+# ==============================================================
+# Initialisation de l’application Flask
+# ==============================================================
 
 app = Flask(__name__)
+app.secret_key = "super_secret_key"  # À changer pour une vraie clé secrète en prod
 
-# Charger les credentials (token.json) générés après l'autorisation
-creds = Credentials.from_authorized_user_file("token.json", ["https://www.googleapis.com/auth/calendar"])
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+
+
+# ==============================================================
+# Accueil
+# ==============================================================
 
 @app.route('/')
 def home():
-    return "✅ Assistant Alamo Agenda connecté à Google Calendar et prêt à recevoir des commandes."
+    return "🌐 Assistant Alamo Agenda connecté et en ligne."
+
+
+# ==============================================================
+# Autorisation Google OAuth
+# ==============================================================
+
+@app.route('/authorize')
+def authorize():
+    flow = InstalledAppFlow.from_client_secrets_file(
+        'credentials.json', SCOPES)
+    flow.redirect_uri = 'https://alamo-agenda-assistant.onrender.com/oauth2callback'
+
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true')
+
+    session['state'] = state
+    return redirect(authorization_url)
+
+
+@app.route('/oauth2callback')
+def oauth2callback():
+    state = session['state']
+    flow = InstalledAppFlow.from_client_secrets_file(
+        'credentials.json', SCOPES, state=state)
+    flow.redirect_uri = 'https://alamo-agenda-assistant.onrender.com/oauth2callback'
+
+    authorization_response = request.url
+    flow.fetch_token(authorization_response=authorization_response)
+
+    creds = flow.credentials
+    with open('token.json', 'w') as token:
+        token.write(creds.to_json())
+
+    return "✅ Authentication completed! You can close this window."
+
+
+# ==============================================================
+# Test de connexion Google Calendar
+# ==============================================================
+
+@app.route('/test')
+def test_connection():
+    try:
+        creds = Credentials.from_authorized_user_file(
+            "token.json", SCOPES)
+        service = build('calendar', 'v3', credentials=creds)
+        calendar = service.calendars().get(calendarId='primary').execute()
+        return jsonify({
+            "status": "✅ Assistant connecté à Google Calendar !",
+            "calendar": calendar["summary"]
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "❌ Erreur de connexion",
+            "message": str(e)
+        })
+
+
+# ==============================================================
+# Endpoint /command — interprétation d’une commande naturelle
+# ==============================================================
 
 @app.route('/command', methods=['POST'])
-def command():
-    data = request.get_json()
-    message = data.get("message", "").lower()
+def add_event():
+    try:
+        data = request.get_json()
+        instruction = data.get("instruction", "").lower()
 
-    service = build("calendar", "v3", credentials=creds)
+        # Exemple simple : "rajoute un rendez-vous FNAC le 10 octobre à 14h"
+        import re
+        import dateparser
 
-    if "ajoute" in message or "rajoute" in message:
+        match = re.search(r"le (\d{1,2} [a-zéû]+)(?: à (\d{1,2}h\d{0,2}))?", instruction)
+        title_match = re.search(r"rendez-vous (.+?) le", instruction)
+
+        if not match or not title_match:
+            return jsonify({"status": "❌", "message": "Impossible de comprendre la commande."})
+
+        title = title_match.group(1).strip().capitalize()
+        date_text = match.group(1)
+        time_text = match.group(2) if match.group(2) else "10h00"
+
+        event_datetime = dateparser.parse(f"{date_text} {time_text}", languages=["fr"])
+
+        start_time = event_datetime.isoformat()
+        end_time = (event_datetime + datetime.timedelta(hours=1)).isoformat()
+
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        service = build('calendar', 'v3', credentials=creds)
+
         event = {
-            'summary': 'Rendez-vous ajouté via Assistant Alamo',
-            'start': {'dateTime': '2025-10-10T15:00:00', 'timeZone': 'Europe/Paris'},
-            'end': {'dateTime': '2025-10-10T16:00:00', 'timeZone': 'Europe/Paris'}
+            'summary': title,
+            'start': {'dateTime': start_time, 'timeZone': 'Europe/Paris'},
+            'end': {'dateTime': end_time, 'timeZone': 'Europe/Paris'},
         }
-        service.events().insert(calendarId='primary', body=event).execute()
-        return jsonify({"response": "✅ Événement ajouté avec succès."})
 
-    elif "supprime" in message or "enlève" in message:
-        events = service.events().list(calendarId='primary', maxResults=10).execute().get('items', [])
-        for event in events:
-            if "fnac" in event['summary'].lower():
-                service.events().delete(calendarId='primary', eventId=event['id']).execute()
-                return jsonify({"response": f"🗑️ Événement '{event['summary']}' supprimé."})
-        return jsonify({"response": "⚠️ Aucun événement correspondant trouvé."})
+        event = service.events().insert(calendarId='primary', body=event).execute()
 
-    else:
-        return jsonify({"response": "Je n’ai pas compris la commande."})
+        return jsonify({
+            "status": "✅",
+            "message": f"Événement ajouté : {title}",
+            "eventLink": event.get('htmlLink')
+        })
+
+    except Exception as e:
+        return jsonify({"status": "❌ Erreur", "message": str(e)})
+
+
+# ==============================================================
+# Lancement de l’application
+# ==============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
